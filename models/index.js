@@ -1,28 +1,15 @@
-const { DataTypes } = require('sequelize')
-const { sequelize } = require('../util/db')
 const Blog = require('./blog')
 const User = require('./user')
+const ReadingList = require('./reading_list')
+const Session = require('./session')
 
 User.hasMany(Blog, { foreignKey: 'userId', as: 'blogs' })
 Blog.belongsTo(User, { foreignKey: 'userId', as: 'user' })
 
-const syncModels = async () => {
-  await User.sync()
-  await Blog.sync()
+User.belongsToMany(Blog, { through: ReadingList, as: 'readings', foreignKey: 'userId', otherKey: 'blogId' })
+Blog.belongsToMany(User, { through: ReadingList, as: 'readers', foreignKey: 'blogId', otherKey: 'userId' })
 
-  // sync() does not add columns to the existing Chapter 2 table. Add only the
-  // nullable ownership column, without alter/force or rewriting existing data.
-  const queryInterface = sequelize.getQueryInterface()
-  const columns = await queryInterface.describeTable('blogs')
-  if (!columns.user_id) {
-    await queryInterface.addColumn('blogs', 'user_id', {
-      type: DataTypes.INTEGER,
-      allowNull: true,
-      references: { model: 'users', key: 'id' },
-      onUpdate: 'CASCADE',
-      onDelete: 'SET NULL'
-    })
-  }
-}
+User.hasMany(Session, { foreignKey: 'userId', as: 'sessions' })
+Session.belongsTo(User, { foreignKey: 'userId', as: 'user' })
 
-module.exports = { Blog, User, syncModels }
+module.exports = { Blog, User, ReadingList, Session }

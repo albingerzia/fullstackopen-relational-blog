@@ -38,18 +38,23 @@ router.get('/', async (req, res) => {
 router.get('/:id', blogFinder, (req, res) => res.json(req.blog))
 
 router.post('/', tokenExtractor, async (req, res) => {
-  const { author, title, url, likes } = jsonObject(req.body)
+  const { author, title, url, likes, year } = jsonObject(req.body)
   nonEmptyString(title, 'title')
   nonEmptyString(url, 'url')
   if (author !== undefined && author !== null && typeof author !== 'string') {
     throw new HttpError(400, 'author must be a string or null.')
   }
   if (likes !== undefined) likesValue(likes)
+  if (year !== undefined && year !== null
+      && (!Number.isInteger(year) || year < 1991 || year > new Date().getUTCFullYear())) {
+    throw new HttpError(400, `year must be an integer between 1991 and ${new Date().getUTCFullYear()}`)
+  }
   const blog = await Blog.create({
     author,
     title,
     url,
     likes: likes === undefined ? 0 : likes,
+    year: year === undefined ? null : year,
     userId: req.user.id
   })
   await blog.reload({ include: userInclude })

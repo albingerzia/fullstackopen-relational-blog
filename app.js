@@ -9,6 +9,8 @@ app.get('/', (_req, res) => res.status(200).json({ status: 'ok' }))
 app.use('/api/blogs', require('./controllers/blogs'))
 app.use('/api/users', require('./controllers/users'))
 app.use('/api/login', require('./controllers/login'))
+app.use('/api/logout', require('./controllers/logout'))
+app.use('/api/readinglists', require('./controllers/readinglists'))
 app.use('/api/authors', require('./controllers/authors'))
 
 if (TESTING) app.use('/api/reset', require('./controllers/reset'))

@@ -1,6 +1,8 @@
 const jwt = require('jsonwebtoken')
 const { ValidationError, UniqueConstraintError, ForeignKeyConstraintError } = require('sequelize')
-const { User } = require('../models')
+const { Op } = require('sequelize')
+const { User, Session } = require('../models')
+const { tokenHash } = require('./session')
 const { SECRET } = require('./config')
 const { HttpError } = require('./errors')
 
@@ -9,11 +11,17 @@ const tokenExtractor = async (req, _res, next) => {
   const match = /^Bearer\s+(\S+)$/i.exec(authorization)
   if (!match) throw new HttpError(401, 'token missing')
   const decoded = jwt.verify(match[1], SECRET, { algorithms: ['HS256'] })
-  if (!decoded || !Number.isInteger(decoded.id) || decoded.id <= 0 || decoded.id > 2147483647) {
+  if (!decoded || !Number.isInteger(decoded.id) || decoded.id <= 0 || decoded.id > 2147483647
+      || !Number.isInteger(decoded.exp) || typeof decoded.jti !== 'string') {
     throw new HttpError(401, 'token invalid')
   }
-  req.user = await User.findByPk(decoded.id)
-  if (!req.user) throw new HttpError(401, 'token user no longer exists')
+  req.session = await Session.findOne({
+    where: { tokenHash: tokenHash(match[1]), userId: decoded.id, expiresAt: { [Op.gt]: new Date() } },
+    include: { model: User, as: 'user' }
+  })
+  if (!req.session || !req.session.user) throw new HttpError(401, 'session expired or revoked')
+  req.user = req.session.user
+  if (req.user.disabled) throw new HttpError(401, 'account disabled, please contact admin')
   next()
 }
 
@@ -25,6 +33,9 @@ const unknownEndpoint = (_req, res) => {
 const errorHandler = (error, _req, res, _next) => {
   if (error instanceof UniqueConstraintError) {
     const messages = error.errors.map(item => item.path === 'username' ? 'username must be unique' : item.message)
+    if (error.original?.constraint === 'reading_lists_user_blog_unique') {
+      return res.status(400).json({ error: ['This blog is already in the user\'s reading list.'] })
+    }
     return res.status(400).json({ error: messages })
   }
   if (error instanceof ValidationError) {
@@ -35,6 +46,9 @@ const errorHandler = (error, _req, res, _next) => {
   }
   if (error instanceof ForeignKeyConstraintError) {
     return res.status(400).json({ error: ['Referenced user or blog does not exist.'] })
+  }
+  if (error.original?.constraint === 'blogs_year_range') {
+    return res.status(400).json({ error: [`year must be an integer between 1991 and ${new Date().getUTCFullYear()}`] })
   }
   if (error instanceof HttpError) {
     return res.status(error.status).json({ error: [error.message] })

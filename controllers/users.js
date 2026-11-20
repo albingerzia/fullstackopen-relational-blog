@@ -33,7 +33,23 @@ router.put('/:username', async (req, res) => {
 })
 
 router.get('/:id', async (req, res) => {
-  const user = await User.findByPk(primaryKey(req.params.id), { include: blogInclude })
+  const read = req.query.read
+  if (read !== undefined && read !== 'true' && read !== 'false') {
+    throw new HttpError(400, 'read must be true or false.')
+  }
+  const user = await User.findByPk(primaryKey(req.params.id), {
+    include: [blogInclude, {
+      model: Blog,
+      as: 'readings',
+      attributes: { exclude: ['userId'] },
+      required: false,
+      through: {
+        attributes: ['id', 'read'],
+        ...(read !== undefined ? { where: { read: read === 'true' } } : {})
+      }
+    }],
+    order: [['blogs', 'id', 'ASC'], ['readings', 'id', 'ASC']]
+  })
   if (!user) throw new HttpError(404, 'User not found.')
   res.json(user)
 })

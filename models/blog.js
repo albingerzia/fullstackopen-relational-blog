@@ -26,13 +26,25 @@ Blog.init({
     type: DataTypes.INTEGER,
     defaultValue: 0,
     validate: { isInt: true }
+  },
+  year: {
+    type: DataTypes.INTEGER,
+    allowNull: true,
+    defaultValue: null,
+    validate: {
+      validYear(value) {
+        if (value !== null && value !== undefined && (!Number.isInteger(value) || value < 1991 || value > new Date().getUTCFullYear())) {
+          throw new Error(`year must be an integer between 1991 and ${new Date().getUTCFullYear()}`)
+        }
+      }
+    }
   }
 }, {
   sequelize,
   modelName: 'blog',
   tableName: 'blogs',
   underscored: true,
-  timestamps: false
+  timestamps: true
 })
 
 module.exports = Blog

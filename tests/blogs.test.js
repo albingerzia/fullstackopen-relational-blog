@@ -9,7 +9,9 @@ require('dotenv').config({ path: path.join(__dirname, '..', '.env'), quiet: true
 // Config validates the separate test database before opening any connection.
 process.env.TESTING = 'true'
 const app = require('../app')
-const { Blog, User } = require('../models')
+const { Blog, User, ReadingList, Session } = require('../models')
+const { randomUUID } = require('node:crypto')
+const { tokenHash } = require('../util/session')
 const { sequelize, connectToDatabase } = require('../util/db')
 const { SECRET } = require('../util/config')
 const { hashPassword } = require('../util/password')
@@ -38,9 +40,9 @@ before(async () => {
 })
 
 beforeEach(async () => {
-  await sequelize.query('TRUNCATE TABLE blogs, users')
+  await sequelize.query('TRUNCATE TABLE sessions, reading_lists, blogs, users')
   owner = await User.create({ username: 'owner@example.com', name: 'Owner', passwordHash })
-  token = jwt.sign({ id: owner.id }, SECRET, { expiresIn: '1h' })
+  token = await createSession(owner.id)
 })
 
 after(async () => {
@@ -51,6 +53,13 @@ after(async () => {
   }
   await sequelize.close()
 })
+
+const createSession = async userId => {
+  const token = jwt.sign({ id: userId }, SECRET, { expiresIn: '1h', jwtid: randomUUID() })
+  const { exp } = jwt.decode(token)
+  await Session.create({ userId, tokenHash: tokenHash(token), expiresAt: new Date(exp * 1000) })
+  return token
+}
 
 const postBlog = body => fetch(`${baseUrl}/api/blogs`, {
   method: 'POST',
@@ -65,7 +74,7 @@ test('GET /api/blogs returns an empty JSON array initially', async () => {
   assert.deepEqual(await response.json(), [])
 })
 
-test('GET /api/blogs returns every stored blog without timestamp columns', async () => {
+test('GET /api/blogs returns every stored blog including year and timestamps', async () => {
   await Blog.create(sample)
   await Blog.create({ ...sample, title: 'Another blog', likes: 7 })
   const response = await fetch(`${baseUrl}/api/blogs`)
@@ -74,7 +83,7 @@ test('GET /api/blogs returns every stored blog without timestamp columns', async
   assert.equal(blogs.length, 2)
   assert.equal(blogs[0].likes, 7)
   assert.equal(blogs[1].title, sample.title)
-  assert.deepEqual(Object.keys(blogs[0]).sort(), ['author', 'id', 'likes', 'title', 'url', 'user'])
+  assert.deepEqual(Object.keys(blogs[0]).sort(), ['author', 'createdAt', 'id', 'likes', 'title', 'updatedAt', 'url', 'user', 'year'])
 })
 
 test('POST /api/blogs persists a blog and defaults likes to zero', async () => {
@@ -410,7 +419,7 @@ test('DELETE blogs requires authentication and forbids other users from deleting
   const blog = await Blog.create({ ...sample, userId: owner.id })
   assert.equal((await request(`/api/blogs/${blog.id}`, { method: 'DELETE' })).status, 401)
   const other = await User.create({ username: 'other@example.com', name: 'Other', passwordHash })
-  const otherToken = jwt.sign({ id: other.id }, SECRET)
+  const otherToken = await createSession(other.id)
   assert.equal((await request(`/api/blogs/${blog.id}`, { method: 'DELETE', auth: otherToken })).status, 403)
   assert.ok(await Blog.findByPk(blog.id))
 })
@@ -476,4 +485,206 @@ test('reset empties both test tables without reusing token identity', async () =
   const replacement = await User.create({ username: owner.username, name: 'Replacement', passwordHash })
   assert.notEqual(replacement.id, owner.id)
   assert.equal((await request('/api/blogs', { method: 'POST', body: sample, auth: token })).status, 401)
+})
+
+for (const year of [1990, new Date().getUTCFullYear() + 1, 2001.5, '2001', true, {}]) {
+  test(`POST blogs rejects invalid year ${JSON.stringify(year)}`, async () => {
+    const response = await postBlog({ ...sample, year })
+    assert.equal(response.status, 400)
+    assert.match((await response.json()).error[0], /year must be an integer between 1991 and/)
+    assert.equal(await Blog.count(), 0)
+  })
+}
+
+for (const year of [1991, new Date().getUTCFullYear(), null]) {
+  test(`POST blogs accepts year ${year}`, async () => {
+    const response = await postBlog({ ...sample, year })
+    assert.equal(response.status, 201)
+    const blog = await response.json()
+    assert.equal(blog.year, year)
+    assert.ok(blog.createdAt)
+    assert.equal(blog.createdAt, blog.updatedAt)
+  })
+}
+
+test('blog updatedAt advances while createdAt remains unchanged', async () => {
+  const blog = await Blog.create(sample)
+  await new Promise(resolve => setTimeout(resolve, 15))
+  const response = await request(`/api/blogs/${blog.id}`, { method: 'PUT', body: { likes: 9 } })
+  const data = await response.json()
+  assert.equal(data.createdAt, blog.createdAt.toISOString())
+  assert.ok(Date.parse(data.updatedAt) > blog.updatedAt.getTime())
+})
+
+test('reading list defaults to unread and ignores client supplied state and id', async () => {
+  const blog = await Blog.create(sample)
+  const response = await request('/api/readinglists', { method: 'POST', body: { userId: owner.id, blogId: blog.id, read: true, id: 2000000000 } })
+  assert.equal(response.status, 201)
+  const entry = await response.json()
+  assert.equal(entry.read, false)
+  assert.notEqual(entry.id, 2000000000)
+  assert.equal(entry.userId, owner.id)
+  assert.equal(entry.blogId, blog.id)
+  const user = await (await request(`/api/users/${owner.id}`)).json()
+  assert.deepEqual(user.readings[0].readingList, { id: entry.id, read: false })
+  assert.equal(user.readings[0].id, blog.id)
+  assert.equal(user.readings[0].userId, undefined)
+})
+
+for (const field of ['userId', 'blogId']) {
+  for (const value of [undefined, null, '1', 0, -1, 1.5, 2147483648]) {
+    test(`reading lists reject invalid ${field} ${JSON.stringify(value)}`, async () => {
+      const blog = await Blog.create(sample)
+      const response = await request('/api/readinglists', { method: 'POST', body: { userId: owner.id, blogId: blog.id, [field]: value } })
+      assert.equal(response.status, 400)
+      assert.match((await response.json()).error[0], new RegExp(field))
+      assert.equal(await ReadingList.count(), 0)
+    })
+  }
+}
+
+test('reading lists return 404 for missing references and 400 for duplicates', async () => {
+  const blog = await Blog.create(sample)
+  for (const body of [{ userId: 2147483647, blogId: blog.id }, { userId: owner.id, blogId: 2147483647 }]) {
+    assert.equal((await request('/api/readinglists', { method: 'POST', body })).status, 404)
+  }
+  const body = { userId: owner.id, blogId: blog.id }
+  const results = await Promise.all([1, 2].map(() => request('/api/readinglists', { method: 'POST', body })))
+  assert.deepEqual(results.map(response => response.status).sort(), [201, 400])
+  assert.equal(await ReadingList.count(), 1)
+})
+
+test('reading list state is editable only by its owner with a live session', async () => {
+  const blog = await Blog.create(sample)
+  const entry = await ReadingList.create({ userId: owner.id, blogId: blog.id })
+  const other = await User.create({ username: 'other@example.com', name: 'Other', passwordHash })
+  const otherToken = await createSession(other.id)
+  assert.equal((await request(`/api/readinglists/${entry.id}`, { method: 'PUT', body: { read: true } })).status, 401)
+  assert.equal((await request(`/api/readinglists/${entry.id}`, { method: 'PUT', body: { read: true }, auth: otherToken })).status, 401)
+  for (const read of [true, false]) {
+    const response = await request(`/api/readinglists/${entry.id}`, { method: 'PUT', body: { read, userId: other.id }, auth: token })
+    assert.equal(response.status, 200)
+    const data = await response.json()
+    assert.equal(data.read, read)
+    assert.equal(data.userId, owner.id)
+  }
+})
+
+test('reading list updates validate boolean state and IDs', async () => {
+  const blog = await Blog.create(sample)
+  const entry = await ReadingList.create({ userId: owner.id, blogId: blog.id })
+  for (const read of [undefined, 'true', 1, null]) {
+    assert.equal((await request(`/api/readinglists/${entry.id}`, { method: 'PUT', body: { read }, auth: token })).status, 400)
+  }
+  assert.equal((await request('/api/readinglists/2147483647', { method: 'PUT', body: { read: true }, auth: token })).status, 404)
+  assert.equal((await request('/api/readinglists/invalid', { method: 'PUT', body: { read: true }, auth: token })).status, 400)
+})
+
+test('read filtering affects readings only, not authored blogs or user existence', async () => {
+  const [unread, read] = await Blog.bulkCreate([{ ...sample, userId: owner.id }, { ...sample, title: 'Read post' }])
+  await ReadingList.bulkCreate([{ userId: owner.id, blogId: unread.id }, { userId: owner.id, blogId: read.id, read: true }])
+  const all = await (await request(`/api/users/${owner.id}`)).json()
+  assert.equal(all.readings.length, 2)
+  for (const state of [true, false]) {
+    const user = await (await request(`/api/users/${owner.id}?read=${state}`)).json()
+    assert.equal(user.readings.length, 1)
+    assert.equal(user.readings[0].readingList.read, state)
+    assert.equal(user.blogs.length, 1)
+  }
+  await ReadingList.destroy({ where: {} })
+  const empty = await request(`/api/users/${owner.id}?read=true`)
+  assert.equal(empty.status, 200)
+  assert.deepEqual((await empty.json()).readings, [])
+  assert.equal((await request(`/api/users/${owner.id}?read=invalid`)).status, 400)
+  assert.equal((await request(`/api/users/${owner.id}?read=true&read=false`)).status, 400)
+})
+
+test('deleting a blog cascades its reading list entries', async () => {
+  const blog = await Blog.create({ ...sample, userId: owner.id })
+  await ReadingList.create({ userId: owner.id, blogId: blog.id })
+  assert.equal((await request(`/api/blogs/${blog.id}`, { method: 'DELETE', auth: token })).status, 204)
+  assert.equal(await ReadingList.count(), 0)
+})
+
+test('login stores only a token digest and supports multiple independent sessions', async () => {
+  const tokens = []
+  for (let i = 0; i < 2; i++) {
+    const response = await request('/api/login', { method: 'POST', body: { username: owner.username, password: 'test-password-123' } })
+    assert.equal(response.status, 200)
+    const { token: value } = await response.json()
+    tokens.push(value)
+    const session = await Session.findOne({ where: { tokenHash: tokenHash(value) } })
+    assert.ok(session)
+    assert.equal(session.userId, owner.id)
+    assert.equal(session.expiresAt.getTime(), jwt.decode(value).exp * 1000)
+    assert.ok(!JSON.stringify(session).includes(value))
+    assert.equal((await request('/api/blogs', { method: 'POST', body: sample, auth: value })).status, 201)
+  }
+  assert.notEqual(tokens[0], tokens[1])
+})
+
+test('logout revokes every session of that user but not another user', async () => {
+  const second = await createSession(owner.id)
+  const other = await User.create({ username: 'other@example.com', name: 'Other', passwordHash })
+  const otherToken = await createSession(other.id)
+  assert.equal((await request('/api/logout', { method: 'DELETE', auth: token })).status, 204)
+  for (const auth of [token, second]) {
+    assert.equal((await request('/api/blogs', { method: 'POST', body: sample, auth })).status, 401)
+  }
+  assert.equal(await Session.count({ where: { userId: owner.id } }), 0)
+  assert.equal((await request('/api/blogs', { method: 'POST', body: sample, auth: otherToken })).status, 201)
+  assert.equal((await request('/api/logout', { method: 'DELETE', auth: token })).status, 401)
+  assert.equal((await request('/api/logout', { method: 'DELETE' })).status, 401)
+})
+
+test('a correctly signed token without an active session cannot authenticate', async () => {
+  const forged = jwt.sign({ id: owner.id }, SECRET, { expiresIn: '1h', jwtid: randomUUID() })
+  assert.equal((await request('/api/blogs', { method: 'POST', body: sample, auth: forged })).status, 401)
+  await Session.update({ expiresAt: new Date(0) }, { where: { userId: owner.id } })
+  assert.equal((await request('/api/blogs', { method: 'POST', body: sample, auth: token })).status, 401)
+})
+
+test('database disabling revokes sessions immediately and old tokens stay invalid after re-enabling', async () => {
+  const blog = await Blog.create({ ...sample, userId: owner.id })
+  const entry = await ReadingList.create({ userId: owner.id, blogId: blog.id })
+  await sequelize.query('UPDATE users SET disabled=true WHERE id=$1', { bind: [owner.id] })
+  assert.equal(await Session.count({ where: { userId: owner.id } }), 0)
+  assert.equal((await request('/api/login', { method: 'POST', body: { username: owner.username, password: 'test-password-123' } })).status, 401)
+  for (const [route, method, body] of [
+    ['/api/blogs', 'POST', sample], [`/api/blogs/${blog.id}`, 'DELETE'],
+    [`/api/readinglists/${entry.id}`, 'PUT', { read: true }], ['/api/logout', 'DELETE']
+  ]) {
+    assert.equal((await request(route, { method, body, auth: token })).status, 401)
+  }
+  await sequelize.query('UPDATE users SET disabled=false WHERE id=$1', { bind: [owner.id] })
+  assert.equal((await request('/api/blogs', { method: 'POST', body: sample, auth: token })).status, 401)
+  const login = await request('/api/login', { method: 'POST', body: { username: owner.username, password: 'test-password-123' } })
+  const active = (await login.json()).token
+  assert.equal(login.status, 200)
+  assert.equal((await request('/api/blogs', { method: 'POST', body: sample, auth: active })).status, 201)
+})
+
+test('disabling and re-enabling without intervening requests still revokes the old token', async () => {
+  await sequelize.query('UPDATE users SET disabled=true WHERE id=$1', { bind: [owner.id] })
+  await sequelize.query('UPDATE users SET disabled=false WHERE id=$1', { bind: [owner.id] })
+  assert.equal((await request('/api/blogs', { method: 'POST', body: sample, auth: token })).status, 401)
+})
+
+test('registration and name updates cannot set disabled status', async () => {
+  const response = await request('/api/users', { method: 'POST', body: { ...newUser, disabled: true } })
+  assert.equal(response.status, 201)
+  assert.equal((await response.json()).disabled, false)
+  await User.update({ disabled: true }, { where: { id: owner.id } })
+  await request(`/api/users/${owner.username}`, { method: 'PUT', body: { name: 'Changed', disabled: false } })
+  assert.equal((await owner.reload()).disabled, true)
+})
+
+test('reset removes reading lists and sessions but preserves migration metadata', async () => {
+  const blog = await Blog.create(sample)
+  await ReadingList.create({ userId: owner.id, blogId: blog.id })
+  const [before] = await sequelize.query('SELECT name FROM migrations ORDER BY name')
+  assert.equal((await request('/api/reset', { method: 'POST' })).status, 204)
+  for (const model of [Blog, User, ReadingList, Session]) assert.equal(await model.count(), 0)
+  const [after] = await sequelize.query('SELECT name FROM migrations ORDER BY name')
+  assert.deepEqual(after, before)
 })
