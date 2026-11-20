@@ -27,8 +27,6 @@ Docker menyimpan data di named volume, sehingga `npm run db:down` tidak menghapu
 
 ## Latihan 1 — Repository dan koneksi psql
 
-Repository GitHub privat harus mengundang akun `mluukkai` sebagai kolaborator sesuai instruksi kursus. Undangan perlu diterima oleh akun tersebut sebelum akses aktif.
-
 Buka konsol PostgreSQL:
 
 ```bash
@@ -153,7 +151,3 @@ util/db.js             Koneksi dan sinkronisasi schema
 compose.yaml           PostgreSQL dengan volume persisten
 tests/blogs.test.js     Tes integrasi HTTP, SQL, dan CLI
 ```
-
-## Submission kursus
-
-Kode dan repo saja tidak otomatis mengubah progres kursus. Selesaikan lalu kunci Chapter 1 sesuai UI kursus untuk membuka latihan Chapter 2. Setelah terbuka, kirim URL repository melalui halaman submission. Bila repo privat, pastikan undangan `mluukkai` sudah diterima. Penandaan bab dan submission perlu dilakukan melalui akun kursusmu.
