@@ -1,47 +1,74 @@
 const router = require('express').Router()
-const Blog = require('../models/blog')
+const { Op } = require('sequelize')
+const { Blog, User } = require('../models')
+const { tokenExtractor } = require('../util/middleware')
+const { HttpError } = require('../util/errors')
+const { jsonObject, nonEmptyString, likesValue, primaryKey } = require('../util/validation')
 
-const MAX_INTEGER = 2147483647
-const MIN_INTEGER = -2147483648
+const userInclude = { model: User, as: 'user', attributes: ['id', 'username', 'name'] }
 
-router.get('/', async (_req, res) => {
-  const blogs = await Blog.findAll({ order: [['id', 'ASC']] })
+const blogFinder = async (req, _res, next) => {
+  req.blog = await Blog.findByPk(primaryKey(req.params.id), { include: userInclude })
+  if (!req.blog) throw new HttpError(404, 'Blog not found.')
+  next()
+}
+
+router.get('/', async (req, res) => {
+  const where = {}
+  if (req.query.search !== undefined) {
+    if (typeof req.query.search !== 'string') throw new HttpError(400, 'search must be a string.')
+    if (req.query.search) {
+      // Treat % and _ literally rather than as user-controlled SQL wildcards.
+      const search = req.query.search.replace(/[\\%_]/g, '\\$&')
+      where[Op.or] = [
+        { title: { [Op.iLike]: `%${search}%` } },
+        { author: { [Op.iLike]: `%${search}%` } }
+      ]
+    }
+  }
+  const blogs = await Blog.findAll({
+    attributes: { exclude: ['userId'] },
+    include: userInclude,
+    where,
+    order: [['likes', 'DESC NULLS LAST'], ['id', 'ASC']]
+  })
   res.json(blogs)
 })
 
-router.post('/', async (req, res) => {
-  const body = req.body
-  if (!body || typeof body !== 'object' || Array.isArray(body)) {
-    return res.status(400).json({ error: 'Send a JSON object containing title and url.' })
-  }
+router.get('/:id', blogFinder, (req, res) => res.json(req.blog))
 
-  const { author, title, url, likes } = body
-  if (typeof title !== 'string' || !title.trim() || typeof url !== 'string' || !url.trim()) {
-    return res.status(400).json({ error: 'title and url must be non-empty strings.' })
-  }
+router.post('/', tokenExtractor, async (req, res) => {
+  const { author, title, url, likes } = jsonObject(req.body)
+  nonEmptyString(title, 'title')
+  nonEmptyString(url, 'url')
   if (author !== undefined && author !== null && typeof author !== 'string') {
-    return res.status(400).json({ error: 'author must be a string or null.' })
+    throw new HttpError(400, 'author must be a string or null.')
   }
-  if (likes !== undefined && (!Number.isInteger(likes) || likes < MIN_INTEGER || likes > MAX_INTEGER)) {
-    return res.status(400).json({ error: 'likes must be a 32-bit integer.' })
-  }
-
-  // Explicitly select editable fields; clients cannot set the primary key.
-  const blog = await Blog.create({ author, title, url, likes: likes === undefined ? 0 : likes })
-  return res.status(201).json(blog)
+  if (likes !== undefined) likesValue(likes)
+  const blog = await Blog.create({
+    author,
+    title,
+    url,
+    likes: likes === undefined ? 0 : likes,
+    userId: req.user.id
+  })
+  await blog.reload({ include: userInclude })
+  res.status(201).json(blog)
 })
 
-router.delete('/:id', async (req, res) => {
-  const { id } = req.params
-  if (!/^[1-9]\d*$/.test(id) || Number(id) > MAX_INTEGER) {
-    return res.status(400).json({ error: 'id must be a positive 32-bit integer.' })
-  }
+router.put('/:id', blogFinder, async (req, res) => {
+  const { likes } = jsonObject(req.body)
+  req.blog.likes = likesValue(likes)
+  await req.blog.save()
+  res.json(req.blog)
+})
 
-  const deleted = await Blog.destroy({ where: { id: Number(id) } })
-  if (deleted === 0) {
-    return res.status(404).json({ error: 'Blog not found.' })
+router.delete('/:id', tokenExtractor, blogFinder, async (req, res) => {
+  if (req.blog.userId !== req.user.id) {
+    throw new HttpError(403, 'Only the user who added this blog may delete it.')
   }
-  return res.status(204).end()
+  await req.blog.destroy()
+  res.status(204).end()
 })
 
 module.exports = router
